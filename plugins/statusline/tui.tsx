@@ -71,43 +71,68 @@ function shortTcBuildLabel(buildTypeId?: string, buildTypeName?: string, id?: nu
   return id ? String(id) : "build"
 }
 
+function extractTopLevelTriggeredBuild(text: string): { id: number; buildTypeId?: string; buildTypeName?: string } | null {
+  // Отрезаем snapshot-dependencies, чтобы не подхватывать дочерние сборки цепочки
+  const rootSection = text.split('"snapshot-dependencies"')[0] ?? text
+
+  // 1. Ответ MCP teamcity_rest_post (JSON envelope { meta, body: { id, buildTypeId, buildType: { id, name } } } или прямой объект)
+  try {
+    const parsed = JSON.parse(text)
+    const obj = parsed?.body && typeof parsed.body === "object" ? parsed.body : parsed
+    if (typeof obj?.id === "number" && obj.id > 0) {
+      return {
+        id: obj.id,
+        buildTypeId: typeof obj.buildTypeId === "string" ? obj.buildTypeId : obj.buildType?.id,
+        buildTypeName: typeof obj.buildType?.name === "string" ? obj.buildType.name : undefined,
+      }
+    }
+  } catch {}
+
+  // 2. Fallback по регуляркам (если в выводе несколько команд или текст вокруг JSON)
+  const queueMatch =
+    rootSection.match(/\/app\/rest\/buildQueue\/id:(\d+)/) ??
+    rootSection.match(/https?:\/\/teamcity\.(?:local\.)?playrix\.com\/build\/(\d+)/) ??
+    rootSection.match(/"body"\s*:\s*\{[^}]*"id"\s*:\s*(\d+)/) ??
+    rootSection.match(/^\s*\{\s*"id"\s*:\s*(\d+)/m)
+  if (!queueMatch?.[1]) return null
+
+  const id = Number(queueMatch[1])
+  if (!Number.isInteger(id) || id <= 0) return null
+
+  const btMatch =
+    rootSection.match(/"buildTypeId"\s*:\s*"([^"]+)"/) ??
+    rootSection.match(/"buildType"\s*:\s*\{[^}]*"id"\s*:\s*"([^"]+)"/)
+  return { id, buildTypeId: btMatch?.[1] }
+}
+
 function collectTriggeredTcBuildsFromMessages(messages: readonly any[]): Map<number, Partial<TcBuildInfo>> {
   const byLabel = new Map<string, { id: number; info: Partial<TcBuildInfo> }>()
   for (const msg of messages) {
     if (msg?.type !== "assistant" || !Array.isArray(msg.content)) continue
     for (const part of msg.content) {
       if (part?.type !== "tool") continue
-      const isShellTrigger =
-        part.name === "shell" &&
-        typeof part.state?.input?.command === "string" &&
-        (/\bteamcity\s+trigger\b/i.test(part.state.input.command) ||
-          /\/app\/rest\/buildQueue\b/i.test(part.state.input.command))
       const isMcpTrigger =
         (part.name === "execute" &&
           typeof part.state?.input?.code === "string" &&
           (/teamcity_rest_post/.test(part.state.input.code) || /\/app\/rest\/buildQueue/.test(part.state.input.code))) ||
         (typeof part.name === "string" && part.name.includes("teamcity_rest_post"))
+      const isShellTrigger =
+        part.name === "shell" &&
+        typeof part.state?.input?.command === "string" &&
+        (/\bteamcity\s+trigger\b/i.test(part.state.input.command) ||
+          /\/app\/rest\/buildQueue\b/i.test(part.state.input.command))
 
-      if (!isShellTrigger && !isMcpTrigger) continue
+      if (!isMcpTrigger && !isShellTrigger) continue
       const outputs = Array.isArray(part.state?.content) ? part.state.content : []
       for (const out of outputs) {
         const text = typeof out?.text === "string" ? out.text : ""
         if (!text) continue
 
-        // Отрезаем snapshot-dependencies, чтобы не подхватывать дочерние сборки цепочки
-        const rootSection = text.split('"snapshot-dependencies"')[0] ?? text
-        const queueMatch =
-          rootSection.match(/\/app\/rest\/buildQueue\/id:(\d+)/) ??
-          rootSection.match(/https?:\/\/teamcity\.(?:local\.)?playrix\.com\/build\/(\d+)/)
-        if (!queueMatch?.[1]) continue
+        const extracted = extractTopLevelTriggeredBuild(text)
+        if (!extracted) continue
 
-        const id = Number(queueMatch[1])
-        if (!Number.isInteger(id) || id <= 0) continue
-
-        const beforeQueue = rootSection.slice(0, queueMatch.index ?? rootSection.length)
-        const btMatches = [...beforeQueue.matchAll(/"buildTypeId"\s*:\s*"([^"]+)"/g)]
-        const buildTypeId = btMatches[btMatches.length - 1]?.[1]
-        const label = shortTcBuildLabel(buildTypeId, undefined, id)
+        const { id, buildTypeId, buildTypeName } = extracted
+        const label = shortTcBuildLabel(buildTypeId, buildTypeName, id)
 
         const prev = byLabel.get(label)
         if (!prev || id >= prev.id) {
@@ -607,8 +632,10 @@ export default Plugin.define({
     const computeSessionTcBuilds = (sessionID: string | undefined): { visible: TcBuildInfo[]; toPoll: number[] } => {
       if (!sessionID) return { visible: [], toPoll: [] }
       const rootID = data.session.root(sessionID)
-      const messages = data.session.message.list(rootID)
-      const triggered = collectTriggeredTcBuildsFromMessages(messages as any[])
+      const familyRaw = data.session.family(rootID)
+      const familyIDs = familyRaw.includes(rootID) ? familyRaw : [rootID, ...familyRaw]
+      const messages = familyIDs.flatMap((id) => data.session.message.list(id) as any[])
+      const triggered = collectTriggeredTcBuildsFromMessages(messages)
       if (triggered.size === 0) return { visible: [], toPoll: [] }
 
       const cache = tcBuildsById()
