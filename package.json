@@ -1,0 +1,12 @@
+{
+  "name": "opencode-statusline",
+  "version": "1.0.0",
+  "description": "OpenCode V2 TUI statusbar plugin: AI real/total work time, LiteLLM budget, session PRs with CI/review status, and TeamCity builds via MCP",
+  "type": "module",
+  "exports": {
+    "./tui": "./plugins/statusline/tui.tsx"
+  },
+  "files": [
+    "plugins"
+  ]
+}
