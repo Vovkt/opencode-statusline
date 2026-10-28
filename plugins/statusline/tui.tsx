@@ -281,7 +281,11 @@ function formatDuration(sec: number): string {
 }
 
 function git(dir: string, args: string[]) {
-  return execFileSync("git", ["-C", dir, ...args], { timeout: 1000, encoding: "utf8" })
+  return execFileSync("git", ["-C", dir, ...args], {
+    timeout: 1000,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  })
 }
 
 function gitInfo(dir: string): GitInfo | undefined {
